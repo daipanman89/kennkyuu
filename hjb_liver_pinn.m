@@ -30,9 +30,21 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     domLow  = opts.domLowFrac  .* scaleX;
     domHigh = opts.domHighFrac .* scaleX;
 
-    %% ---- ネットワーク構築 ----
-    valueNet  = build_value_net(7, opts.hiddenUnits);
-    policyNet = build_policy_net(7, 6, aLow, aHigh, opts.hiddenUnits);
+    if ~isempty(opts.seed), rng(opts.seed); end
+
+    %% ---- ネットワーク構築（前回のPicard反復のネットがあればウォームスタート） ----
+    if ~isempty(opts.initValueNet)
+        valueNet = opts.initValueNet;
+    else
+        valueNet = build_value_net(7, opts.hiddenUnits);
+    end
+    if ~isempty(opts.initPolicyNet)
+        policyNet = opts.initPolicyNet;
+    else
+        policyNet = build_policy_net(7, 6, aLow, aHigh, opts.hiddenUnits);
+    end
+    termCfg = struct('hard', opts.hardTerminal, 'T', T, 'scaleX', scaleX, ...
+        'targetCoA', targetCoA, 'targetX05', targetX05, 'w_coa', w_coa, 'w_x05', w_x05);
 
     avgV=[]; avgSqV=[]; avgP=[]; avgSqP=[];
     lossHistory = zeros(opts.numIters,1);
@@ -97,7 +109,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
 
         [gradTh, gradPh, lossVal, lPDE, lTerm, lHam] = dlfeval(@modelLoss, valueNet, policyNet, X, XT, ...
             re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
-            currentTermWeight, aHigh, aLow, opts.w_satPenalty);
+            currentTermWeight, aHigh, aLow, opts.w_satPenalty, termCfg);
 
         % --- Valueネットワークの事前学習（Pre-training）と学習率減衰 ---
         decaySteps = floor(iter / opts.lrDecayEvery);
@@ -134,7 +146,7 @@ end
 
 % =====================================================================
 function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(valueNet, policyNet, X, XT, ...
-    re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, currentTermWeight, aHigh, aLow, w_satPenalty)
+    re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, currentTermWeight, aHigh, aLow, w_satPenalty, termCfg)
 
     xRaw = X(1:6,:);
     Xn   = [xRaw ./ scaleX; X(7,:) ./ T];
@@ -144,7 +156,7 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     aRaw   = forward(policyNet, Xn);              
     aFixed = dlarray(extractdata(aRaw));          
 
-    V0 = forward(valueNet, Xn);                   
+    V0 = value_eval(valueNet, X, termCfg);
 
     gradAll = dlgradient(sum(V0,'all'), X, 'EnableHigherDerivatives', true); 
     gradX = gradAll(1:6,:);
@@ -181,8 +193,8 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     for i = 1:6
         Xp = X; Xp(i,:) = Xp(i,:) + h(i);
         Xm = X; Xm(i,:) = Xm(i,:) - h(i);
-        Vp = forward(valueNet, [Xp(1:6,:)./scaleX; Xp(7,:)./T]);
-        Vm = forward(valueNet, [Xm(1:6,:)./scaleX; Xm(7,:)./T]);
+        Vp = value_eval(valueNet, Xp, termCfg);
+        Vm = value_eval(valueNet, Xm, termCfg);
         d2 = (Vp - 2*V0 + Vm) ./ (h(i)^2);
         lap = lap + (sigma(i)^2) .* d2;
     end
@@ -190,11 +202,10 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     residual = gradT + runCostV + driftTermV + 0.5 .* lap;
     lossPDE = mean(residual.^2, 'all');
 
-    xRawT = XT(1:6,:);
-    XnT   = [xRawT ./ scaleX; XT(7,:) ./ T];
-    VT    = forward(valueNet, XnT);
-    gT    = w_coa .* (xRawT(4,:)./targetCoA - 1).^2 ...
-          + w_x05 .* (xRawT(1,:)./targetX05 - 1).^2;
+    % hardTerminal=true のときは V(T,x)=g(x) が構造的に成り立つので lossTerm は恒等的に0
+    % （確認用にそのまま計算して記録しておく）
+    VT    = value_eval(valueNet, XT, termCfg);
+    gT    = terminal_cost(XT(1:6,:), termCfg);
     lossTerm = mean((VT - gT).^2, 'all');
 
     % 固定重み(terminalWeight)から動的重み(currentTermWeight)へ変更
@@ -202,6 +213,27 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
 
     gradTh = dlgradient(lossVal, valueNet.Learnables);  
     gradPh = dlgradient(lossHam, policyNet.Learnables); 
+end
+
+function V = value_eval(valueNet, X, cfg)
+%VALUE_EVAL  生の [x;t] (7×B) から V(t,x) を評価する。
+%   cfg.hard=true のとき  V(t,x) = g(x) + (T-t) * NN(x/scaleX, t/T)
+%   とし、終端条件 V(T,x)=g(x) を構造的に満たす。
+%   ランニングコストは [1/sec] 単位でT=86400秒ぶん積分されるため、V(0,x) は
+%   g(x) より何桁も大きくなる。NN にはその「1秒あたりの平均コスト」(O(1)~O(100))
+%   だけを学習させ、桁の大きさは (T-t) が受け持つ。
+    Xn = [X(1:6,:) ./ cfg.scaleX; X(7,:) ./ cfg.T];
+    NN = forward(valueNet, Xn);
+    if cfg.hard
+        V = terminal_cost(X(1:6,:), cfg) + (cfg.T - X(7,:)) .* NN;
+    else
+        V = NN;
+    end
+end
+
+function g = terminal_cost(xRaw, cfg)
+    g = cfg.w_coa .* (xRaw(4,:)./cfg.targetCoA - 1).^2 ...
+      + cfg.w_x05 .* (xRaw(1,:)./cfg.targetX05 - 1).^2;
 end
 
 function net = build_value_net(inDim, hidden)
@@ -265,7 +297,11 @@ function opts = parse_opts(opts)
         'lrDecayFactor', 0.5, ...   
         'causalWarmupFrac', 0.5, ... 
         'fdStep',        0.01, ...
-        'printEvery',    500 ...
+        'printEvery',    500, ...
+        'hardTerminal',  true, ...   % ★V=g(x)+(T-t)NN で終端条件を厳密に課す（終端Lossの重み調整が不要になる）
+        'initValueNet',  [], ...     % ★前回のPicard反復のネット（ウォームスタート用）
+        'initPolicyNet', [], ...
+        'seed',          [] ...      % ★乱数シード（[]なら設定しない）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)

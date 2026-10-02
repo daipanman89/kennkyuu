@@ -27,7 +27,10 @@ if isfield(S.hjbInfo, 'lossPDEHistory')
     semilogy(S.hjbInfo.lossHistory); hold on;
     semilogy(S.hjbInfo.lossPDEHistory);
     
-    if isfield(S.hjbInfo.opts, 'terminalWeight')
+    hardTerm = isfield(S.hjbInfo.opts, 'hardTerminal') && S.hjbInfo.opts.hardTerminal;
+    if hardTerm
+        % 終端条件はネットの形で厳密に課しているので終端Lossは常に0（対数軸に描けない）
+    elseif isfield(S.hjbInfo.opts, 'terminalWeight')
         semilogy(S.hjbInfo.opts.terminalWeight .* S.hjbInfo.lossTermHistory);
     else
         iters = (1:length(S.hjbInfo.lossTermHistory))';
@@ -37,7 +40,11 @@ if isfield(S.hjbInfo, 'lossPDEHistory')
         semilogy(dynamicWeights .* S.hjbInfo.lossTermHistory);
     end
 
-    legendEntries = {'Value合計','PDE残差','終端条件(重み込み)'};
+    if hardTerm
+        legendEntries = {'Value合計','PDE残差'};
+    else
+        legendEntries = {'Value合計','PDE残差','終端条件(重み込み)'};
+    end
     if isfield(S.hjbInfo, 'lossHamHistory')
         semilogy(abs(S.hjbInfo.lossHamHistory));
         legendEntries{end+1} = '|H(policy)| (方策のハミルトニアン)';

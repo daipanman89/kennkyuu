@@ -33,7 +33,9 @@ tolRel       = 1e-3;
 hjbOpts = struct('T', T, 'numIters', 40000, 'batchSize', 256, ...
                   'lrValue', 1e-3, 'lrPolicy', 1e-4, 'printEvery', 1000);
 
-fpOpts = struct('T', T, 'numCells', 100, 'dt', 1, 'doPlot', false); % dt=10は不安定と判明(diagnose_stability.m)
+fpOpts = struct('T', T, 'numCells', 100, 'dt', 1, 'doPlot', false, ... % dt=10は不安定と判明(diagnose_stability.m)
+                'seed', 1); % 全反復で同じ乱数列（共通乱数）を使い、MCノイズによる振動を防ぐ
+hjbSeed = 1;
 
 %% ---- 初期値（DDPGと同じ「目標値+1000」） ----
 targetB = [5000; 1000; 1000; 100]; % [GLU;VLDL;FFA;GLR]
@@ -45,6 +47,7 @@ refTraj = []; % 初回はまだFPの実軌道が無いので、チャンク開�
 
 bHistoryFinal = zeros(4, maxOuterIter+1); % 各反復での b(T)（終端値）の推移を記録（収束の目安表示用）
 bHistoryFinal(:,1) = b0;
+valueNet = []; policyNet = []; % 2回目以降は前回のネットからウォームスタートする
 
 for k = 1:maxOuterIter
     fprintf('\n========== Picard反復 %d / %d ==========\n', k, maxOuterIter);
@@ -52,7 +55,16 @@ for k = 1:maxOuterIter
 
     % --- 1) HJBを解く（代表エージェントの最適方策、有限ホライズン、PINN法） ---
     % refTraj: 前回のFPロールアウトの実軌道（k=1では空 = 一様サンプリングのみ）
-    [valueNet, policyNet, hjbInfo] = hjb_liver_pinn(bTraj, hjbOpts, refTraj); %#ok<ASGLU>
+    % 前回のネットを初期値にする（毎回ランダム初期化すると、HJBの未収束ぶんの
+    % ばらつきが反復ごとに入れ替わり、b(t)が収束せず振動する原因になる）
+    hjbOptsK = hjbOpts;
+    hjbOptsK.seed = hjbSeed;
+    hjbOptsK.initValueNet  = valueNet;
+    hjbOptsK.initPolicyNet = policyNet;
+    if k > 1
+        hjbOptsK.pretrainIters = 0; % Valueは前回の解から始まるので事前学習は不要
+    end
+    [valueNet, policyNet, hjbInfo] = hjb_liver_pinn(bTraj, hjbOptsK, refTraj);
 
     % --- 2) FPを解く（100細胞シミュレーションで新しいb(t)を再構成） ---
     [bTrajNew, traj, fpInfo] = fp_liver_particles(policyNet, bTraj.val(:,1), fpOpts); %#ok<ASGLU>
@@ -64,10 +76,12 @@ for k = 1:maxOuterIter
     bOldOnNewGrid = interp1(bTraj.t, bTraj.val', bTrajNew.t, 'linear', 'extrap')';
     bUpdatedVal = (1-damping) .* bOldOnNewGrid + damping .* bTrajNew.val;
 
-    relChange = norm(bUpdatedVal - bOldOnNewGrid, 'fro') / max(norm(bOldOnNewGrid,'fro'), 1e-8);
+    % 不動点残差 ||Φ(b_k) - b_k|| / ||b_k||（ダンピング前で評価する。ダンピング後の差で
+    % 評価すると damping 倍だけ小さく見え、許容値が実質 1/damping 倍緩くなってしまう）
+    relChange = norm(bTrajNew.val - bOldOnNewGrid, 'fro') / max(norm(bOldOnNewGrid,'fro'), 1e-8);
 
     fprintf('b_new(T)(FPより) = [%s]\n', mat2str(bTrajNew.val(:,end)',4));
-    fprintf('b_updated(T)     = [%s]   (相対変化 %.4g)\n', mat2str(bUpdatedVal(:,end)',4), relChange);
+    fprintf('b_updated(T)     = [%s]   (不動点残差 %.4g)\n', mat2str(bUpdatedVal(:,end)',4), relChange);
 
     bTraj = struct('t', bTrajNew.t, 'val', bUpdatedVal);
     bHistoryFinal(:,k+1) = bUpdatedVal(:,end);
@@ -75,7 +89,7 @@ for k = 1:maxOuterIter
     save(sprintf('mfg_iter_%02d.mat', k), 'bTraj', 'valueNet', 'policyNet', 'traj', 'hjbInfo', 'fpInfo', '-v7.3');
 
     if relChange < tolRel
-        fprintf('\n収束しました（相対変化 %.4g < 許容値 %.4g）。反復 %d で終了。\n', ...
+        fprintf('\n収束しました（不動点残差 %.4g < 許容値 %.4g）。反復 %d で終了。\n', ...
             relChange, tolRel, k);
         bHistoryFinal = bHistoryFinal(:,1:k+1);
         break;

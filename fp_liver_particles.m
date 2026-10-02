@@ -57,6 +57,10 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 
     isFuncPolicy = isa(policyNet, 'function_handle');
 
+    % 共通乱数（common random numbers）: Picard反復ごとに同じ初期分布・同じノイズ列を
+    % 使うことで、b(t)の変化を「方策の変化」だけに帰着させ、反復間のMCノイズを消す
+    if ~isempty(opts.seed), rng(opts.seed); end
+
     % --- 初期値の生成（母集団の初期分布。DDPGと同じ「目標値+1000」を中心に） ---
     x0center = scaleX; % 細胞内状態は目標値そのままスタート(+1000は血中因子側のみ)
     x = x0center .* (1 + opts.initSpreadFrac .* randn(6, N));
@@ -185,7 +189,8 @@ function opts = parse_opts(opts)
         'numLogPoints',   500, ...
         'aLow',           zeros(6,1), ...
         'aHigh',          [100;100;10;10;30;30], ... % hjb_liver_pinn.mと揃える(a5,a6の天井を引き上げ)
-        'doPlot',         true ...
+        'doPlot',         true, ...
+        'seed',           [] ...     % 乱数シード（[]なら設定しない）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)
