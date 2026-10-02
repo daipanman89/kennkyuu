@@ -113,8 +113,12 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
 
         % --- Valueネットワークの事前学習（Pre-training）と学習率減衰 ---
         decaySteps = floor(iter / opts.lrDecayEvery);
-        lrV = opts.lrValue  * (opts.lrDecayFactor ^ decaySteps);
-        lrP = opts.lrPolicy * (opts.lrDecayFactor ^ decaySteps);
+        % 学習率ウォームアップ: Adamの内部状態は呼び出しごとにリセットされるため、
+        % ウォームスタート直後(bTrajが変わった直後)に大きな一歩を踏んで loss が
+        % 跳ね上がるのを防ぐ
+        warmup = min(1, iter / max(1, opts.lrWarmupIters));
+        lrV = warmup * opts.lrValue  * (opts.lrDecayFactor ^ decaySteps);
+        lrP = warmup * opts.lrPolicy * (opts.lrDecayFactor ^ decaySteps);
 
         % Value側は常に更新
         [valueNet, avgV, avgSqV] = adamupdate(valueNet, gradTh, avgV, avgSqV, iter, lrV);
@@ -165,27 +169,19 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
 
     dxdt_a = liver_cell_drift(xRaw, aRaw, bAtT, re); 
 
-    a5norm = aRaw(5,:) ./ aHigh(5);
-    a6norm = aRaw(6,:) ./ aHigh(6);
-    coaExcess = max((x08 - targetCoA) ./ targetCoA, 0);
-    coaPushBonus = w_coaPush .* coaExcess .* (a5norm + a6norm); 
-                                                                  
-    runCostA = w_coa .* (x08./targetCoA - 1).^2 ...
-             + w_x05 .* (x05./targetX05 - 1).^2 ...
-             + w_ctrl .* sum(aRaw.^2, 1) ...
-             - coaPushBonus;
+    % 方策側(H最小化)と価値側(PDE残差)で同じランニングコストを使う。
+    % 以前は coaPushBonus と satPenalty が方策側にしか入っておらず、方策は
+    % V が評価しているのとは別のコストを最適化していた（方策反復として不整合）。
+    runCostA = running_cost(x05, x08, aRaw, targetCoA, targetX05, w_coa, w_x05, ...
+                            w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow);
 
-    tanhOut = (2.*aRaw - aHigh - aLow) ./ (aHigh - aLow); 
-    satPenalty = w_satPenalty .* sum(-log(max(1 - tanhOut.^2, 1e-8)), 1);
-
-    Hamiltonian = runCostA + satPenalty + sum(gradXFixed .* dxdt_a, 1); 
+    Hamiltonian = runCostA + sum(gradXFixed .* dxdt_a, 1); 
     lossHam = mean(Hamiltonian, 'all');
 
     dxdt_v = liver_cell_drift(xRaw, aFixed, bAtT, re); 
 
-    runCostV = w_coa .* (x08./targetCoA - 1).^2 ...
-             + w_x05 .* (x05./targetX05 - 1).^2 ...
-             + w_ctrl .* sum(aFixed.^2, 1); 
+    runCostV = running_cost(x05, x08, aFixed, targetCoA, targetX05, w_coa, w_x05, ...
+                            w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow);
 
     driftTermV = sum(gradX .* dxdt_v, 1);
 
@@ -213,6 +209,27 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
 
     gradTh = dlgradient(lossVal, valueNet.Learnables);  
     gradPh = dlgradient(lossHam, policyNet.Learnables); 
+end
+
+function c = running_cost(x05, x08, a, targetCoA, targetX05, w_coa, w_x05, ...
+                          w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow)
+    a5norm = a(5,:) ./ aHigh(5);
+    a6norm = a(6,:) ./ aHigh(6);
+    coaExcess = max((x08 - targetCoA) ./ targetCoA, 0);
+    coaPushBonus = w_coaPush .* coaExcess .* (a5norm + a6norm);
+
+    % 飽和ペナルティ: -log(1-tanh^2) は a=(aHigh+aLow)/2（範囲の中央）で最小になる。
+    % 重みが大きいと、Hの勾配項が弱い成分は中央値に吸い寄せられる
+    % （a5,a6 が常に約15 = 30/2 に張り付き、coaを排出し続けていた原因）。
+    % あくまで tanh の飽和（勾配消失）を防ぐための弱いバリアとして使う。
+    tanhOut = (2.*a - aHigh - aLow) ./ (aHigh - aLow);
+    satPenalty = w_satPenalty .* sum(-log(max(1 - tanhOut.^2, 1e-8)), 1);
+
+    c = w_coa .* (x08./targetCoA - 1).^2 ...
+      + w_x05 .* (x05./targetX05 - 1).^2 ...
+      + w_ctrl .* sum(a.^2, 1) ...
+      + satPenalty ...
+      - coaPushBonus;
 end
 
 function V = value_eval(valueNet, X, cfg)
@@ -279,7 +296,7 @@ function opts = parse_opts(opts)
         'w_x05',         9.0 * (5/1.5), ...
         'w_coaPush',     8.0, ... 
         'w_ctrl',        1e-4, ...
-        'w_satPenalty',  1.0, ... 
+        'w_satPenalty',  1e-2, ... % ★1.0だと a5,a6 が範囲中央(15)に張り付くため弱くした
         'refFrac',       0.5, ...   
         'refJitterFrac', 0.02, ...  
         'domLowFrac',    0.2, ...
@@ -295,6 +312,7 @@ function opts = parse_opts(opts)
         'lrPolicy',      1e-4, ...
         'lrDecayEvery',  10000, ... 
         'lrDecayFactor', 0.5, ...   
+        'lrWarmupIters', 2000, ...   % ★学習率を 0 から線形に立ち上げる反復数
         'causalWarmupFrac', 0.5, ... 
         'fdStep',        0.01, ...
         'printEvery',    500, ...
