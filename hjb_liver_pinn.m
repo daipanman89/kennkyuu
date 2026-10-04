@@ -43,6 +43,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     else
         policyNet = build_policy_net(7, 6, aLow, aHigh, opts.hiddenUnits);
     end
+    polCfg = struct('wLogit', opts.w_logitPenalty, 'logitMax', opts.logitMax, 'aRef', opts.aRef);
     termCfg = struct('hard', opts.hardTerminal, 'T', T, 'scaleX', scaleX, ...
         'targetCoA', targetCoA, 'targetX05', targetX05, 'w_coa', w_coa, 'w_x05', w_x05);
 
@@ -109,7 +110,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
 
         [gradTh, gradPh, lossVal, lPDE, lTerm, lHam] = dlfeval(@modelLoss, valueNet, policyNet, X, XT, ...
             re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
-            currentTermWeight, aHigh, aLow, opts.w_satPenalty, termCfg);
+            currentTermWeight, aHigh, aLow, polCfg, termCfg);
 
         % --- Valueネットワークの事前学習（Pre-training）と学習率減衰 ---
         decaySteps = floor(iter / opts.lrDecayEvery);
@@ -150,14 +151,15 @@ end
 
 % =====================================================================
 function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(valueNet, policyNet, X, XT, ...
-    re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, currentTermWeight, aHigh, aLow, w_satPenalty, termCfg)
+    re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, currentTermWeight, aHigh, aLow, polCfg, termCfg)
 
     xRaw = X(1:6,:);
     Xn   = [xRaw ./ scaleX; X(7,:) ./ T];
     x05  = xRaw(1,:);
     x08  = xRaw(4,:);
 
-    aRaw   = forward(policyNet, Xn);              
+    % 出力層 tanh に入る前のロジット z も取り出す（飽和の監視・抑制用）
+    [zLogit, aRaw] = forward(policyNet, Xn, 'Outputs', {'fc3','scale_out'});
     aFixed = dlarray(extractdata(aRaw));          
 
     V0 = value_eval(valueNet, X, termCfg);
@@ -170,18 +172,24 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     dxdt_a = liver_cell_drift(xRaw, aRaw, bAtT, re); 
 
     % 方策側(H最小化)と価値側(PDE残差)で同じランニングコストを使う。
-    % 以前は coaPushBonus と satPenalty が方策側にしか入っておらず、方策は
-    % V が評価しているのとは別のコストを最適化していた（方策反復として不整合）。
     runCostA = running_cost(x05, x08, aRaw, targetCoA, targetX05, w_coa, w_x05, ...
-                            w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow);
+                            w_coaPush, w_ctrl, polCfg.aRef, aHigh);
 
     Hamiltonian = runCostA + sum(gradXFixed .* dxdt_a, 1); 
-    lossHam = mean(Hamiltonian, 'all');
+
+    % tanh飽和の防止: ロジット |z| が logitMax を超えた分だけを罰する（不感帯つき）。
+    % tanh を通さずに z へ直接勾配が届くので、一度飽和しても戻ってこられる。
+    % 以前の -log(1-tanh^2) バリアは、重みが大きいと a を範囲中央へ引き寄せ、
+    % 小さいと飽和後に勾配が0になって境界に張り付いたまま動けなくなっていた
+    % （a1 が下限0に張り付いた原因）。これはパラメータ化の正則化であって
+    % 生体側のコストではないので、価値V側のコストには入れない。
+    logitPenalty = polCfg.wLogit .* sum(max(abs(zLogit) - polCfg.logitMax, 0).^2, 1);
+    lossHam = mean(Hamiltonian + logitPenalty, 'all');
 
     dxdt_v = liver_cell_drift(xRaw, aFixed, bAtT, re); 
 
     runCostV = running_cost(x05, x08, aFixed, targetCoA, targetX05, w_coa, w_x05, ...
-                            w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow);
+                            w_coaPush, w_ctrl, polCfg.aRef, aHigh);
 
     driftTermV = sum(gradX .* dxdt_v, 1);
 
@@ -212,23 +220,18 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
 end
 
 function c = running_cost(x05, x08, a, targetCoA, targetX05, w_coa, w_x05, ...
-                          w_coaPush, w_ctrl, w_satPenalty, aHigh, aLow)
+                          w_coaPush, w_ctrl, aRef, aHigh)
     a5norm = a(5,:) ./ aHigh(5);
     a6norm = a(6,:) ./ aHigh(6);
     coaExcess = max((x08 - targetCoA) ./ targetCoA, 0);
     coaPushBonus = w_coaPush .* coaExcess .* (a5norm + a6norm);
 
-    % 飽和ペナルティ: -log(1-tanh^2) は a=(aHigh+aLow)/2（範囲の中央）で最小になる。
-    % 重みが大きいと、Hの勾配項が弱い成分は中央値に吸い寄せられる
-    % （a5,a6 が常に約15 = 30/2 に張り付き、coaを排出し続けていた原因）。
-    % あくまで tanh の飽和（勾配消失）を防ぐための弱いバリアとして使う。
-    tanhOut = (2.*a - aHigh - aLow) ./ (aHigh - aLow);
-    satPenalty = w_satPenalty .* sum(-log(max(1 - tanhOut.^2, 1e-8)), 1);
-
+    % 制御コストは「中立な制御 aRef からのずれ」に掛ける。aRef=0 のままだと、
+    % 例えば a1=0（グルカゴン最優位）が「最も安い制御」になってしまい、
+    % 中立ではなく片側の極端に寄せる力として働く。
     c = w_coa .* (x08./targetCoA - 1).^2 ...
       + w_x05 .* (x05./targetX05 - 1).^2 ...
-      + w_ctrl .* sum(a.^2, 1) ...
-      + satPenalty ...
+      + w_ctrl .* sum((a - aRef).^2, 1) ...
       - coaPushBonus;
 end
 
@@ -296,7 +299,9 @@ function opts = parse_opts(opts)
         'w_x05',         9.0 * (5/1.5), ...
         'w_coaPush',     8.0, ... 
         'w_ctrl',        1e-4, ...
-        'w_satPenalty',  1e-2, ... % ★1.0だと a5,a6 が範囲中央(15)に張り付くため弱くした
+        'w_logitPenalty', 1.0, ... % ★tanh手前のロジットが |z|>logitMax になった分だけ罰する
+        'logitMax',      2.5, ...  % ★tanh(2.5)=0.987。範囲の端から約0.7%以内には入れない
+        'aRef',          zeros(6,1), ... % ★制御コストの基準（中立な制御）。liver_cell_drift.m を見て要設定
         'refFrac',       0.5, ...   
         'refJitterFrac', 0.02, ...  
         'domLowFrac',    0.2, ...
