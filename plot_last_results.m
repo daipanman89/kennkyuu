@@ -113,4 +113,14 @@ if isfield(S.traj, 'aMean')
     grid on; xlabel('time [hour]'); ylabel('gain');
     legend({'a5 (gain\_r16, インスリン依存の排出)','a6 (gain\_r17, 常時使える排出)'}, 'Location','best');
     title('coaの排出経路のゲイン');
+
+    % coaの流入側(a3: r07 グルコース由来, a4: r15 脂肪酸由来)と a2(MTP) も確認する
+    figure('Name', sprintf('[%s] 方策の出力a(t)の母集団平均（全成分）', fname));
+    aNames = {'a1 (act\_Ins/Gca)','a2 (act\_MTP)','a3 (gain\_r07, coa流入: グルコース由来)', ...
+              'a4 (gain\_r15, coa流入: 脂肪酸由来)','a5 (gain\_r16, coa排出)','a6 (gain\_r17, coa排出)'};
+    for i = 1:6
+        subplot(3,2,i);
+        plot(S.traj.t/3600, S.traj.aMean(i,:), 'LineWidth',1.3);
+        grid on; xlabel('time [hour]'); title(aNames{i});
+    end
 end
