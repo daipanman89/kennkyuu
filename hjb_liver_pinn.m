@@ -50,6 +50,8 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         'targetCoA', targetCoA, 'targetX05', targetX05, 'w_coa', w_coa, 'w_x05', w_x05);
 
     avgV=[]; avgSqV=[]; avgP=[]; avgSqP=[];
+    gradNormEma = [];   % 価値ネットの勾配ノルムの指数移動平均（勾配クリッピング用）
+    nClipped = 0;
     lossHistory = zeros(opts.numIters,1);
     lossPDEHistory = zeros(opts.numIters,1);
     lossTermHistory = zeros(opts.numIters,1);
@@ -124,7 +126,27 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         lrP = warmup * opts.lrPolicy * (opts.lrDecayFactor ^ decaySteps);
 
         % Value側は常に更新
-        [valueNet, avgV, avgSqV] = adamupdate(valueNet, gradTh, avgV, avgSqV, iter, lrV);
+        % 勾配クリッピング: 勾配ノルムが移動平均の gradClipFactor 倍を超えたら縮める。
+        % argminH では制御 a* が ∇V に対して不連続に切り替わる（ほぼbang-bang）ため、
+        % a* が一斉に反転したバッチで残差と勾配が桁違いに大きくなり、1回の更新で
+        % V が壊れて loss が 1e9 まで跳ねることがある。その1歩を抑える。
+        gradNorm = sqrt(sum(cellfun(@(g) double(sum(extractdata(g).^2, 'all')), gradTh.Value)));
+        if isempty(gradNormEma) && isfinite(gradNorm)
+            gradNormEma = gradNorm;
+        elseif isfinite(gradNorm)
+            clipAt = opts.gradClipFactor * gradNormEma;
+            if gradNorm > clipAt
+                gradTh = dlupdate(@(g) g .* (clipAt / gradNorm), gradTh);
+                nClipped = nClipped + 1;
+            end
+            gradNormEma = 0.99 * gradNormEma + 0.01 * min(gradNorm, clipAt);
+        end
+        if ~isfinite(gradNorm)
+            % NaN/Inf の勾配では更新しない
+            lossVal = NaN;
+        else
+            [valueNet, avgV, avgSqV] = adamupdate(valueNet, gradTh, avgV, avgSqV, iter, lrV);
+        end
 
         % Policy側は pretrainIters を超えてから更新を開始する（Adamの内部カウンタもリセット）
         % controlMode='argminH' では制御を ∇V から直接計算するので方策ネットは学習しない
@@ -140,9 +162,9 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         lossHamHistory(iter) = double(lHam);
 
         if mod(iter, opts.printEvery) == 0 || iter == 1
-            fprintf('[HJB] iter %6d / %6d   V-loss = %.6g (PDE=%.6g, 終端=%.6g)   H(policy) = %.6g   termW=%.2g   lrP=%.2g\n', ...
+            fprintf('[HJB] iter %6d / %6d   V-loss = %.6g (PDE=%.6g, 終端=%.6g)   H(policy) = %.6g   termW=%.2g   lrP=%.2g   clip累計=%d\n', ...
                 iter, opts.numIters, lossHistory(iter), lossPDEHistory(iter), lossTermHistory(iter), ...
-                lossHamHistory(iter), currentTermWeight, lrP);
+                lossHamHistory(iter), currentTermWeight, lrP, nClipped);
         end
     end
 
@@ -333,6 +355,7 @@ function opts = parse_opts(opts)
         'lrDecayEvery',  10000, ... 
         'lrDecayFactor', 0.5, ...   
         'lrWarmupIters', 2000, ...   % ★学習率を 0 から線形に立ち上げる反復数
+        'gradClipFactor', 5, ...     % ★価値ネットの勾配ノルムが移動平均の何倍を超えたら縮めるか
         'causalWarmupFrac', 0.5, ... 
         'fdStep',        0.01, ...
         'printEvery',    500, ...
