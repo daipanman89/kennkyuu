@@ -53,7 +53,13 @@ X = dlarray([xK; tK], 'CB');
 p = double(extractdata(gradV(1:6,:)));   % 6×K  ∂V/∂x
 Vk = double(extractdata(Vk));
 
-aPol = double(extractdata(forward(S.policyNet, dlarray(net_input(xK, tK, scaleX, T), 'CB'))));
+if isfield(opts, 'controlMode') && strcmp(opts.controlMode, 'argminH')
+    % argminH では方策ネットは使っていないので、FPで実際に使われた制御（母集団平均）と比べる
+    fprintf('controlMode=argminH: 青線は FP で実際に使われた制御の母集団平均です。\n');
+    aPol = S.traj.aMean(:, kIdx);
+else
+    aPol = double(extractdata(forward(S.policyNet, dlarray(net_input(xK, tK, scaleX, T), 'CB'))));
+end
 aPol = min(max(aPol, aLow), aHigh);
 
 %% ---- a* = argmin_a H を座標ごとのグリッド探索で求める ----

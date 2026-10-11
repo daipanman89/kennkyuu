@@ -34,7 +34,9 @@ hjbOpts = struct('T', T, 'numIters', 40000, 'batchSize', 256, ...
                   'lrValue', 1e-3, 'lrPolicy', 1e-4, 'printEvery', 1000);
 
 fpOpts = struct('T', T, 'numCells', 100, 'dt', 1, 'doPlot', false, ... % dt=10は不安定と判明(diagnose_stability.m)
-                'seed', 1); % 全反復で同じ乱数列（共通乱数）を使い、MCノイズによる振動を防ぐ
+                'seed', 1, ...       % 全反復で同じ乱数列（共通乱数）を使い、MCノイズによる振動を防ぐ
+                'controlEvery', 10); % argminH の制御は10秒ごとに再計算（∇Vの評価が重いため）
+R = load('re_params.mat', 're'); re = R.re;
 hjbSeed = 1;
 
 %% ---- 初期値（DDPGと同じ「目標値+1000」） ----
@@ -67,7 +69,13 @@ for k = 1:maxOuterIter
     [valueNet, policyNet, hjbInfo] = hjb_liver_pinn(bTraj, hjbOptsK, refTraj);
 
     % --- 2) FPを解く（100細胞シミュレーションで新しいb(t)を再構成） ---
-    [bTrajNew, traj, fpInfo] = fp_liver_particles(policyNet, bTraj.val(:,1), fpOpts); %#ok<ASGLU>
+    % controlMode='argminH' では、各細胞の制御を ∇V から a* = argmin_a H で直接計算する
+    if strcmp(hjbInfo.opts.controlMode, 'argminH')
+        fpPolicy = @(t, x, b) argmin_policy(valueNet, t, x, b, re, hjbInfo.opts);
+    else
+        fpPolicy = policyNet;
+    end
+    [bTrajNew, traj, fpInfo] = fp_liver_particles(fpPolicy, bTraj.val(:,1), fpOpts); %#ok<ASGLU>
 
     % --- 次回のHJB学習で使う「実際に訪れた点」として今回のtrajを保存 ---
     refTraj = struct('t', traj.t, 'xAll', traj.xAll);

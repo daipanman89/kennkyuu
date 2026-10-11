@@ -14,8 +14,9 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 %   入力
 %     policyNet : hjb_liver_pinn.m で学習した方策ネット（dlnetwork、
 %                 入力は正規化済み[x;t]の7次元）。
-%                 単体テスト用に function_handle @(t,x) も渡せる
-%                 （t: スカラー[sec], x: 6×N → 6×N の制御を返す）。
+%                 function_handle @(t,x) または @(t,x,b) も渡せる
+%                 （t: スカラー[sec], x: 6×N, b: 4×1 → 6×N の制御を返す）。
+%                 controlMode='argminH' では argmin_policy.m を包んだ @(t,x,b) を渡す。
 %     bInit     : 4×1  血中因子の初期値（省略時は目標値+1000）
 %     opts      : struct（省略可）。PARSE_OPTS 参照。
 %
@@ -87,15 +88,19 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
     for step = 1:nSteps
         tCur = (step-1) * dt;
 
-        % --- 方策の評価 ---
-        if isFuncPolicy
-            a = policyNet(tCur, x); % 6×N の double
-        else
-            Xn = dlarray(net_input(x, tCur, scaleX, T), 'CB');
-            aRaw = forward(policyNet, Xn);
-            a = extractdata(aRaw);
+        % --- 方策の評価（controlEvery ステップごとに更新し、その間は保持する） ---
+        if mod(step-1, opts.controlEvery) == 0
+            if isFuncPolicy && nargin(policyNet) >= 3
+                a = policyNet(tCur, x, b); % argmin_policy など、血中状態 b も使う方策
+            elseif isFuncPolicy
+                a = policyNet(tCur, x); % 6×N の double
+            else
+                Xn = dlarray(net_input(x, tCur, scaleX, T), 'CB');
+                aRaw = forward(policyNet, Xn);
+                a = extractdata(aRaw);
+            end
+            a = min(max(a, aLow), aHigh);
         end
-        a = min(max(a, aLow), aHigh);
 
         % --- 各細胞の細胞内ドリフト + 血中側フラックス ---
         bRep = repmat(b, 1, N);
@@ -190,7 +195,8 @@ function opts = parse_opts(opts)
         'aLow',           zeros(6,1), ...
         'aHigh',          [100;100;10;10;30;30], ... % hjb_liver_pinn.mと揃える(a5,a6の天井を引き上げ)
         'doPlot',         true, ...
-        'seed',           [] ...     % 乱数シード（[]なら設定しない）
+        'seed',           [], ...    % 乱数シード（[]なら設定しない）
+        'controlEvery',   1 ...      % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)

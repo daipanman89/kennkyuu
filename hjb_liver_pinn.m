@@ -43,7 +43,9 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     else
         policyNet = build_policy_net(7, 6, aLow, aHigh, opts.hiddenUnits);
     end
-    polCfg = struct('wLogit', opts.w_logitPenalty, 'logitMax', opts.logitMax, 'aRef', opts.aRef);
+    usePolicyNet = strcmp(opts.controlMode, 'policyNet');
+    polCfg = struct('usePolicyNet', usePolicyNet, 'wLogit', opts.w_logitPenalty, ...
+        'logitMax', opts.logitMax, 'aRef', opts.aRef, 'opts', opts);
     termCfg = struct('hard', opts.hardTerminal, 'T', T, 'scaleX', scaleX, ...
         'targetCoA', targetCoA, 'targetX05', targetX05, 'w_coa', w_coa, 'w_x05', w_x05);
 
@@ -125,7 +127,8 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         [valueNet, avgV, avgSqV] = adamupdate(valueNet, gradTh, avgV, avgSqV, iter, lrV);
 
         % Policy側は pretrainIters を超えてから更新を開始する（Adamの内部カウンタもリセット）
-        if iter > opts.pretrainIters
+        % controlMode='argminH' では制御を ∇V から直接計算するので方策ネットは学習しない
+        if usePolicyNet && iter > opts.pretrainIters
             [policyNet, avgP, avgSqP] = adamupdate(policyNet, gradPh, avgP, avgSqP, iter - opts.pretrainIters, lrP);
         else
             lrP = 0; % 表示用
@@ -158,16 +161,32 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     x05  = xRaw(1,:);
     x08  = xRaw(4,:);
 
-    % 出力層 tanh に入る前のロジット z も取り出す（飽和の監視・抑制用）
-    [zLogit, aRaw] = forward(policyNet, Xn, 'Outputs', {'fc3','scale_out'});
-    aFixed = dlarray(extractdata(aRaw));          
-
     V0 = value_eval(valueNet, X, termCfg);
 
     gradAll = dlgradient(sum(V0,'all'), X, 'EnableHigherDerivatives', true); 
     gradX = gradAll(1:6,:);
     gradT = gradAll(7,:);
     gradXFixed = dlarray(extractdata(gradX));     
+
+    if ~polCfg.usePolicyNet
+        % --- controlMode='argminH': 制御を ∇V から直接 a* = argmin_a H(x,a,∇V) で求める ---
+        % a* は ∇V の関数だが、包絡線定理により min_a H の ∇V に関する微分は f(x,a*) に
+        % 等しいので、a* を定数として扱っても HJB 残差 ∂tV + min_a H + ½σ²ΔV の勾配は厳密。
+        aStar = optimal_control(double(extractdata(xRaw)), bAtT, ...
+                                double(extractdata(gradXFixed)), re, polCfg.opts);
+        aFixed = dlarray(aStar);
+        [lossVal, lossPDE, lossTerm, runCostV, dxdt_v] = value_loss(valueNet, X, XT, V0, gradX, gradT, ...
+            aFixed, re, sigma, h, bAtT, x05, x08, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
+            aHigh, polCfg, termCfg, currentTermWeight);
+        lossHam = mean(runCostV + sum(gradXFixed .* dxdt_v, 1), 'all'); % min_a H（記録用）
+        gradTh = dlgradient(lossVal, valueNet.Learnables);
+        gradPh = [];
+        return;
+    end
+
+    % 出力層 tanh に入る前のロジット z も取り出す（飽和の監視・抑制用）
+    [zLogit, aRaw] = forward(policyNet, Xn, 'Outputs', {'fc3','scale_out'});
+    aFixed = dlarray(extractdata(aRaw));          
 
     dxdt_a = liver_cell_drift(xRaw, aRaw, bAtT, re); 
 
@@ -186,6 +205,19 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     logitPenalty = polCfg.wLogit .* sum(max(abs(zLogit) - polCfg.logitMax, 0).^2, 1);
     lossHam = mean(Hamiltonian + logitPenalty, 'all');
 
+    [lossVal, lossPDE, lossTerm] = value_loss(valueNet, X, XT, V0, gradX, gradT, ...
+        aFixed, re, sigma, h, bAtT, x05, x08, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
+        aHigh, polCfg, termCfg, currentTermWeight);
+
+    gradTh = dlgradient(lossVal, valueNet.Learnables);  
+    gradPh = dlgradient(lossHam, policyNet.Learnables); 
+end
+
+function [lossVal, lossPDE, lossTerm, runCostV, dxdt_v] = value_loss(valueNet, X, XT, V0, gradX, gradT, ...
+    aFixed, re, sigma, h, bAtT, x05, x08, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
+    aHigh, polCfg, termCfg, currentTermWeight)
+%   制御 aFixed を所与としたときの HJB 残差と終端条件の損失
+    xRaw = X(1:6,:);
     dxdt_v = liver_cell_drift(xRaw, aFixed, bAtT, re); 
 
     runCostV = running_cost(x05, x08, aFixed, targetCoA, targetX05, w_coa, w_x05, ...
@@ -214,9 +246,6 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
 
     % 固定重み(terminalWeight)から動的重み(currentTermWeight)へ変更
     lossVal = lossPDE + currentTermWeight .* lossTerm; 
-
-    gradTh = dlgradient(lossVal, valueNet.Learnables);  
-    gradPh = dlgradient(lossHam, policyNet.Learnables); 
 end
 
 function c = running_cost(x05, x08, a, targetCoA, targetX05, w_coa, w_x05, ...
@@ -233,22 +262,6 @@ function c = running_cost(x05, x08, a, targetCoA, targetX05, w_coa, w_x05, ...
       + w_x05 .* (x05./targetX05 - 1).^2 ...
       + w_ctrl .* sum((a - aRef).^2, 1) ...
       - coaPushBonus;
-end
-
-function V = value_eval(valueNet, X, cfg)
-%VALUE_EVAL  生の [x;t] (7×B) から V(t,x) を評価する。
-%   cfg.hard=true のとき  V(t,x) = g(x) + (T-t) * NN(x/scaleX, t/T)
-%   とし、終端条件 V(T,x)=g(x) を構造的に満たす。
-%   ランニングコストは [1/sec] 単位でT=86400秒ぶん積分されるため、V(0,x) は
-%   g(x) より何桁も大きくなる。NN にはその「1秒あたりの平均コスト」(O(1)~O(100))
-%   だけを学習させ、桁の大きさは (T-t) が受け持つ。
-    Xn = [X(1:6,:) ./ cfg.scaleX; X(7,:) ./ cfg.T];
-    NN = forward(valueNet, Xn);
-    if cfg.hard
-        V = terminal_cost(X(1:6,:), cfg) + (cfg.T - X(7,:)) .* NN;
-    else
-        V = NN;
-    end
 end
 
 function g = terminal_cost(xRaw, cfg)
@@ -326,7 +339,10 @@ function opts = parse_opts(opts)
         'hardTerminal',  true, ...   % ★V=g(x)+(T-t)NN で終端条件を厳密に課す（終端Lossの重み調整が不要になる）
         'initValueNet',  [], ...     % ★前回のPicard反復のネット（ウォームスタート用）
         'initPolicyNet', [], ...
-        'seed',          [] ...      % ★乱数シード（[]なら設定しない）
+        'seed',          [], ...     % ★乱数シード（[]なら設定しない）
+        'controlMode',   'argminH', ... % ★'argminH': 制御を ∇V から直接 argmin_a H で計算（方策ネット不使用）
+                                        %   'policyNet': 従来どおり方策ネットを学習する
+        'nGridA',        48 ...      % ★argminH で a1, a2 を探索するグリッド点数
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)

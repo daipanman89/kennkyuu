@@ -22,7 +22,13 @@ end
 [~, idx] = max(nums);
 fname = files(idx).name;
 fprintf('読み込み中: %s\n', fname);
-S = load(fname, 'policyNet', 'bTraj', 'fpInfo');
+S = load(fname, 'policyNet', 'valueNet', 'hjbInfo', 'bTraj', 'fpInfo');
+R = load('re_params.mat', 're');
+if isfield(S.hjbInfo.opts, 'controlMode') && strcmp(S.hjbInfo.opts.controlMode, 'argminH')
+    fpPolicy = @(t, x, b) argmin_policy(S.valueNet, t, x, b, R.re, S.hjbInfo.opts);
+else
+    fpPolicy = S.policyNet;
+end
 
 fpOpts = S.fpInfo.opts;
 fpOpts.doPlot = false;
@@ -32,7 +38,7 @@ nS = numel(seeds);
 for s = 1:nS
     fpOpts.seed = seeds(s);
     fprintf('\n--- seed = %d (%d / %d) ---\n', seeds(s), s, nS);
-    [bTrajS, trajS] = fp_liver_particles(S.policyNet, bInit, fpOpts);
+    [bTrajS, trajS] = fp_liver_particles(fpPolicy, bInit, fpOpts);
     if s == 1
         t = bTrajS.t;
         bAll = zeros(4, numel(t), nS);
