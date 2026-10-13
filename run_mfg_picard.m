@@ -39,9 +39,10 @@ fpOpts = struct('T', T, 'numCells', 100, 'dt', 1, 'doPlot', false, ... % dt=10�
 R = load('re_params.mat', 're'); re = R.re;
 hjbSeed = 1;
 
-%% ---- 初期値（DDPGと同じ「目標値+1000」） ----
-targetB = [5000; 1000; 1000; 100]; % [GLU;VLDL;FFA;GLR]
-b0 = targetB + 1000;
+%% ---- 初期値（DDPGと同じ） ----
+% DDPG（model_singlea2.m の resetFcnLocal）と同じ血中初期値:
+% GLU, VLDL は目標値+1000、FFA, GLR は目標値そのまま
+b0 = [6000; 2000; 1000; 100]; % [GLU;VLDL;FFA;GLR]
 
 % 初回のbTraj推定：時間一定（b0のまま）と仮定してスタート
 bTraj = struct('t', [0, T], 'val', [b0, b0]);

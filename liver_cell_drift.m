@@ -33,7 +33,7 @@ function [dxdt, bflux, rr] = liver_cell_drift(x, a, b, re)
     end
 
     VoB = 5; VoL = 1.5;
-    c1 = 1; c2 = 1/8; c3 = 3; Ka = 10; % c1: 8から1に変更（ユーザー調整済み）
+    c1 = 8; c2 = 1/8; c3 = 3; Ka = 10; % model_single.m / DDPG と同じ値（一時 c1=1 にしていたのを戻した）
 
     x05 = x(1,:); x06 = x(2,:); x07 = x(3,:);
     x08 = x(4,:); x09 = x(5,:); x10 = x(6,:);

@@ -17,7 +17,7 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 %                 function_handle @(t,x) または @(t,x,b) も渡せる
 %                 （t: スカラー[sec], x: 6×N, b: 4×1 → 6×N の制御を返す）。
 %                 controlMode='argminH' では argmin_policy.m を包んだ @(t,x,b) を渡す。
-%     bInit     : 4×1  血中因子の初期値（省略時は目標値+1000）
+%     bInit     : 4×1  血中因子の初期値（省略時は DDPG と同じ [6000;2000;1000;100]）
 %     opts      : struct（省略可）。PARSE_OPTS 参照。
 %
 %   出力
@@ -29,8 +29,7 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 %     info     : struct  シミュレーション設定など
 
     if nargin < 2 || isempty(bInit)
-        targetB = [5000; 1000; 1000; 100];
-        bInit = targetB + 1000;
+        bInit = [6000; 2000; 1000; 100]; % DDPG の resetFcnLocal と同じ
     end
     if nargin < 3, opts = struct(); end
     opts = parse_opts(opts);
@@ -194,7 +193,7 @@ function opts = parse_opts(opts)
         'T',              24*3600, ...% [sec] ホライズン（hjb_liver_pinn.mと合わせること）
         'numLogPoints',   500, ...
         'aLow',           zeros(6,1), ...
-        'aHigh',          [100;100;10;10;30;30], ... % hjb_liver_pinn.mと揃える(a5,a6の天井を引き上げ)
+        'aHigh',          [100;100;10;10;10;10], ... % hjb_liver_pinn.m・DDPG の行動範囲と揃える
         'doPlot',         true, ...
         'seed',           [], ...    % 乱数シード（[]なら設定しない）
         'controlEvery',   1, ...     % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
