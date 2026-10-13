@@ -104,7 +104,8 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 
         % --- 各細胞の細胞内ドリフト + 血中側フラックス ---
         bRep = repmat(b, 1, N);
-        [dxdt, bflux] = liver_cell_drift(x, a, bRep, re);
+        % 速い反応 r13 は dt 秒で使い切る速さが上限（陽的Eulerで質量が増えるのを防ぐ）
+        [dxdt, bflux] = liver_cell_drift_limited(x, a, bRep, re, max(opts.tauFast, dt));
 
         % --- 細胞内状態の更新（Euler-Maruyama） ---
         noise = sigma .* sqrt(dt) .* randn(6, N);
@@ -196,7 +197,8 @@ function opts = parse_opts(opts)
         'aHigh',          [100;100;10;10;30;30], ... % hjb_liver_pinn.mと揃える(a5,a6の天井を引き上げ)
         'doPlot',         true, ...
         'seed',           [], ...    % 乱数シード（[]なら設定しない）
-        'controlEvery',   1 ...      % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
+        'controlEvery',   1, ...     % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
+        'tauFast',        1 ...      % 速い反応 r13 の頭打ちの時定数[秒]（hjb_liver_pinn.m と合わせる）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)

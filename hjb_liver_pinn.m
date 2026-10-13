@@ -69,6 +69,9 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         nBatchRef = round(opts.batchSize * opts.refFrac);
         nBatchUni = opts.batchSize - nBatchRef;
         jitter = opts.refJitterFrac .* scaleX; 
+        % 一様サンプリングの範囲を、前回FPで母集団が実際に訪れた範囲まで広げる
+        % （範囲外の状態では V が外挿頼みになり、∇V の符号が崩れることがあった）
+        domHigh = max(domHigh, 1.2 .* max(refXFlat, [], 2));
         fprintf('[HJB] refTraj使用: 1バッチあたり一様%d点 + 実軌道近傍%d点\n', nBatchUni, nBatchRef);
     else
         nBatchUni = opts.batchSize;
@@ -210,7 +213,7 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     [zLogit, aRaw] = forward(policyNet, Xn, 'Outputs', {'fc3','scale_out'});
     aFixed = dlarray(extractdata(aRaw));          
 
-    dxdt_a = liver_cell_drift(xRaw, aRaw, bAtT, re); 
+    dxdt_a = liver_cell_drift_limited(xRaw, aRaw, bAtT, re, polCfg.opts.tauFast); 
 
     % 方策側(H最小化)と価値側(PDE残差)で同じランニングコストを使う。
     runCostA = running_cost(x05, x08, aRaw, targetCoA, targetX05, w_coa, w_x05, ...
@@ -240,7 +243,7 @@ function [lossVal, lossPDE, lossTerm, runCostV, dxdt_v] = value_loss(valueNet, X
     aHigh, polCfg, termCfg, currentTermWeight)
 %   制御 aFixed を所与としたときの HJB 残差と終端条件の損失
     xRaw = X(1:6,:);
-    dxdt_v = liver_cell_drift(xRaw, aFixed, bAtT, re); 
+    dxdt_v = liver_cell_drift_limited(xRaw, aFixed, bAtT, re, polCfg.opts.tauFast); 
 
     runCostV = running_cost(x05, x08, aFixed, targetCoA, targetX05, w_coa, w_x05, ...
                             w_coaPush, w_ctrl, polCfg.aRef, aHigh);
@@ -355,7 +358,8 @@ function opts = parse_opts(opts)
         'lrDecayEvery',  10000, ... 
         'lrDecayFactor', 0.5, ...   
         'lrWarmupIters', 2000, ...   % ★学習率を 0 から線形に立ち上げる反復数
-        'gradClipFactor', 5, ...     % ★価値ネットの勾配ノルムが移動平均の何倍を超えたら縮めるか
+        'gradClipFactor', 5, ...
+        'tauFast',       1, ...      % ★速い反応 r13 を「tauFast秒で使い切る速さ」で頭打ち（liver_cell_drift_limited.m）     % ★価値ネットの勾配ノルムが移動平均の何倍を超えたら縮めるか
         'causalWarmupFrac', 0.5, ... 
         'fdStep',        0.01, ...
         'printEvery',    500, ...

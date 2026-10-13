@@ -152,7 +152,9 @@ end
 
 function H = hamiltonian(x, a, b, p, re, opts)
 %   hjb_liver_pinn.m の running_cost と同じ走行コスト + p・f
-    dxdt = liver_cell_drift(x, a, b, re);
+    tauFast = 1;
+    if isfield(opts, 'tauFast'), tauFast = opts.tauFast; end
+    dxdt = liver_cell_drift_limited(x, a, b, re, tauFast);
     coaExcess = max((x(4,:) - opts.targetCoA) ./ opts.targetCoA, 0);
     bonus = opts.w_coaPush .* coaExcess .* (a(5,:)./opts.aHigh(5) + a(6,:)./opts.aHigh(6));
     L = opts.w_coa .* (x(4,:)./opts.targetCoA - 1).^2 ...

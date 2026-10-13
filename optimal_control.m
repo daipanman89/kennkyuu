@@ -72,7 +72,9 @@ end
 % =====================================================================
 function v = phi(x, a, b, p, re, opts)
 %   H のうち制御に依存する非2次部分: p・f(x,a,b) - coaPushBonus
-    dxdt = liver_cell_drift(x, a, b, re);
+    tauFast = 1;
+    if isfield(opts, 'tauFast'), tauFast = opts.tauFast; end
+    dxdt = liver_cell_drift_limited(x, a, b, re, tauFast);
     coaExcess = max((x(4,:) - opts.targetCoA) ./ opts.targetCoA, 0);
     bonus = opts.w_coaPush .* coaExcess .* (a(5,:)./opts.aHigh(5) + a(6,:)./opts.aHigh(6));
     v = sum(p .* dxdt, 1) - bonus;

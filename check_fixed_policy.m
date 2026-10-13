@@ -41,7 +41,7 @@ for c = 1:nCase
     xLog(:,1,c) = x; bLog(:,1,c) = b;
     li = 1;
     for step = 1:nSteps
-        [dxdt, bflux] = liver_cell_drift(x, a, b, re);
+        [dxdt, bflux] = liver_cell_drift_limited(x, a, b, re, dt);
         dGLU  = bflux(1) - r46fun(b(1));
         dVLDL = bflux(2) - r45fun(b(2));
         dFFA  = bflux(3) + c3*r45fun(b(2));
