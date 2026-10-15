@@ -261,7 +261,19 @@ function [lossVal, lossPDE, lossTerm, runCostV, dxdt_v] = value_loss(valueNet, X
     end
 
     residual = gradT + runCostV + driftTermV + 0.5 .* lap;
-    lossPDE = mean(residual.^2, 'all');
+    if polCfg.opts.residualNorm
+        % 相対残差: 各サンプルの残差を、HJB の各項の大きさの和（勾配を流さない定数）で割る。
+        % このモデルは x05/x07/x09 の血中との交換(約10秒)や r13(約1秒)が24時間に比べて
+        % 桁違いに速く、それらが大きいサンプルでは ∇V・f が巨大になり、残差の2乗和が
+        % そのサンプルに支配される。その結果、ゆっくり効く coa 方向の ∂V/∂x08 が
+        % ほとんど学習されず符号まで崩れていた。厳密解は全サンプルで残差0なので、
+        % 正の重みで割っても解は変わらず、近似の精度をどこに配分するかだけが変わる。
+        scaleRes = abs(gradT) + abs(runCostV) + sum(abs(gradX .* dxdt_v), 1) + abs(0.5 .* lap);
+        scaleRes = dlarray(extractdata(scaleRes)) + polCfg.opts.residualEps;
+        lossPDE = mean((residual ./ scaleRes).^2, 'all');
+    else
+        lossPDE = mean(residual.^2, 'all');
+    end
 
     % hardTerminal=true のときは V(T,x)=g(x) が構造的に成り立つので lossTerm は恒等的に0
     % （確認用にそのまま計算して記録しておく）
@@ -359,6 +371,8 @@ function opts = parse_opts(opts)
         'lrDecayFactor', 0.5, ...   
         'lrWarmupIters', 2000, ...   % ★学習率を 0 から線形に立ち上げる反復数
         'gradClipFactor', 5, ...
+        'residualNorm',  true, ...   % ★HJB残差を各項の大きさで割った相対残差で学習する
+        'residualEps',   1, ...      % ★相対残差の分母に足す定数（走行コストの単位[1/秒]）
         'tauFast',       1, ...      % ★速い反応 r13 を「tauFast秒で使い切る速さ」で頭打ち（liver_cell_drift_limited.m）     % ★価値ネットの勾配ノルムが移動平均の何倍を超えたら縮めるか
         'causalWarmupFrac', 0.5, ... 
         'fdStep',        0.01, ...
