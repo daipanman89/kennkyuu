@@ -51,6 +51,7 @@ bK = S.traj.b(:, kIdx);          % 4×K
 X = dlarray([xK; tK], 'CB');
 [Vk, gradV] = dlfeval(@value_and_grad, S.valueNet, X, opts);
 p = double(extractdata(gradV(1:6,:)));   % 6×K  ∂V/∂x
+pT = double(extractdata(gradV(7,:)));    % 1×K  ∂V/∂t
 Vk = double(extractdata(Vk));
 
 if isfield(opts, 'controlMode') && strcmp(opts.controlMode, 'argminH')
@@ -119,6 +120,30 @@ plot(th, Hpol - Hopt, 'LineWidth',1.3); grid on;
 xlabel('time [hour]'); ylabel('H(a_{policy}) - H(a^*)');
 title('方策ネットの最適性ギャップ（0に近いほど方策が∇Vに従っている）');
 
+%% ---- 図3: 相対残差の分母（scaleRes）と residualEps の比較 ----
+% hjb_liver_pinn.m の相対残差は residual / (|∂tV| + |L| + Σ|∂V/∂x_i f_i| + |½σ²ΔV| + eps)。
+% 軌道上で分母の各項が eps に比べてどれくらいかを見て、eps が下限として効いて
+% 感度を鈍らせていないか（特に目標付近、coa方向の項 |∂V/∂x08 f08|）を確認する。
+% （½σ²ΔV は σ が非常に小さいので省略）
+eps0 = 1;
+if isfield(opts, 'residualEps'), eps0 = opts.residualEps; end
+Lk = zeros(1,K); pf = zeros(6,K);
+for k = 1:K
+    [Lk(k), pf(:,k)] = hjb_terms(xK(:,k), aOpt(:,k), bK(:,k), p(:,k), re, opts);
+end
+scaleK = abs(pT) + abs(Lk) + sum(abs(pf), 1);
+figure('Name', sprintf('[%s] 相対残差の分母と residualEps', fname));
+semilogy(th, scaleK, 'k-', 'LineWidth',1.5); hold on;
+semilogy(th, abs(pT), 'LineWidth',1.1);
+semilogy(th, abs(Lk), 'LineWidth',1.1);
+semilogy(th, sum(abs(pf),1), 'LineWidth',1.1);
+semilogy(th, abs(pf(4,:)), 'LineWidth',1.3);
+yline(eps0, 'r--', 'LineWidth',1.3);
+grid on; xlabel('time [hour]'); ylabel('magnitude [1/sec]');
+legend({'分母の合計(epsなし)','|\partial_tV|','|L|','\Sigma|\partialV/\partialx_i f_i|', ...
+        '|\partialV/\partialx08 \cdot f08| (coa方向)', sprintf('residualEps = %g', eps0)}, 'Location','best');
+title('相対残差の分母の内訳（赤線より下の項は eps に埋もれて感度が鈍る）');
+
 %% ---- 数値のまとめ ----
 low = xK(4,:) < opts.targetCoA;
 fprintf('\n=== 診断結果 ===\n');
@@ -127,6 +152,10 @@ fprintf('x05が目標未満の時刻のうち dV/dx05 < 0 （正しい符号）�
     100*mean(p(1, xK(1,:) < opts.targetX05) < 0));
 fprintf('H(a_policy) - H(a*) の平均: %.4g   （H(a_policy) の平均絶対値 %.4g）\n', ...
     mean(Hpol - Hopt), mean(abs(Hpol)));
+fprintf('分母(epsなし) < residualEps となる時刻の割合: %.0f %%   （分母の中央値 %.3g, eps = %g）\n', ...
+    100*mean(scaleK < eps0), median(scaleK), eps0);
+fprintf('coa方向の項 |dV/dx08*f08| の中央値: %.3g   （eps に対する比 %.3g）\n', ...
+    median(abs(pf(4,:))), median(abs(pf(4,:)))/eps0);
 names = {'a1','a2','a3','a4','a5','a6'};
 fprintf('時間平均  方策 / argmin H :\n');
 for i = 1:6
@@ -148,6 +177,16 @@ end
 function g = terminal_cost(x, opts)
     g = opts.w_coa .* (x(4,:)./opts.targetCoA - 1).^2 ...
       + opts.w_x05 .* (x(1,:)./opts.targetX05 - 1).^2;
+end
+
+function [L, pf] = hjb_terms(x, a, b, p, re, opts)
+%   走行コスト L と、∇V・f の成分ごとの値 p_i*f_i（6×1）
+    tauFast = 1;
+    if isfield(opts, 'tauFast'), tauFast = opts.tauFast; end
+    dxdt = liver_cell_drift_limited(x, a, b, re, tauFast);
+    H = hamiltonian(x, a, b, p, re, opts);
+    pf = p .* dxdt;
+    L = H - sum(pf, 1);
 end
 
 function H = hamiltonian(x, a, b, p, re, opts)
