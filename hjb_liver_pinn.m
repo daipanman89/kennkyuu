@@ -46,6 +46,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     usePolicyNet = strcmp(opts.controlMode, 'policyNet');
     polCfg = struct('usePolicyNet', usePolicyNet, 'wLogit', opts.w_logitPenalty, ...
         'logitMax', opts.logitMax, 'aRef', opts.aRef, 'opts', opts);
+    polCfg.csN = 0; polCfg.csP = []; polCfg.csW = ones(6,1); polCfg.csLambda = opts.w_costate;
     termCfg = struct('hard', opts.hardTerminal, 'T', T, 'scaleX', scaleX, ...
         'targetCoA', targetCoA, 'targetX05', targetX05, 'w_coa', w_coa, 'w_x05', w_x05);
 
@@ -56,6 +57,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     lossPDEHistory = zeros(opts.numIters,1);
     lossTermHistory = zeros(opts.numIters,1);
     lossHamHistory = zeros(opts.numIters,1);
+    lossCSHistory  = zeros(opts.numIters,1);
     h = opts.fdStep .* scaleX; 
 
     bt = bTraj.t; bv = bTraj.val; 
@@ -76,6 +78,29 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
     else
         nBatchUni = opts.batchSize;
         nBatchRef = 0;
+    end
+
+    % --- 共状態（随伴方程式の解）の準備: 軌道上で ∇V が共状態 p に一致する条件を損失に足す ---
+    % HJB を最適軌道に沿って微分すると（特性曲線法）、∇V は随伴方程式
+    %   dp/dt = -∂L/∂x - (∂f/∂x)^T p,  p(T) = ∇g
+    % を満たす（ポントリャーギンの最大原理）。costate_targets.m で前回のFPの軌道に沿って
+    % これを解いたものを使う。HJB 残差だけでは速い反応に引っ張られて ∇V の向きが
+    % 定まらなかったため、同じ HJB から導かれるこの条件で ∇V を直接拘束する。
+    useCS = opts.w_costate > 0 && ~isempty(refTraj) && isfield(refTraj, 'costate') ...
+            && ~isempty(refTraj.costate);
+    if useCS
+        cs = refTraj.costate;
+        Kc = size(cs.x, 2);
+        csX = reshape(cs.x, 6, []);
+        csP = reshape(cs.p, 6, []);
+        csT = kron(cs.t(:)', ones(1, Kc));
+        % 成分ごとに典型的な大きさで割って、どの成分も同程度に効かせる
+        pScale = sqrt(mean(csP.^2, 2));
+        pScale = max(pScale, 1e-3 * max(pScale) + realmin);
+        polCfg.csW = 1 ./ pScale;
+        domHigh = max(domHigh, 1.2 .* max(csX, [], 2));
+        fprintf('[HJB] 共状態の拘束を使用: %d点（1バッチあたり %d点, 重み %.3g）\n', ...
+            size(csX,2), opts.costateBatch, opts.w_costate);
     end
 
     for iter = 1:opts.numIters
@@ -107,6 +132,16 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
             tb = tbUni;
         end
 
+        if useCS
+            validCS = find(csT >= tMin);
+            if isempty(validCS), validCS = 1:numel(csT); end
+            jCS = validCS(randi(numel(validCS), 1, opts.costateBatch));
+            Xb = [Xb, csX(:, jCS)];          % 共状態の点は最後の列に置く
+            tb = [tb, csT(jCS)];
+            polCfg.csN = opts.costateBatch;
+            polCfg.csP = csP(:, jCS);
+        end
+
         uT  = rand(6, opts.batchSizeTerminal);
         XbT = domLow + uT .* (domHigh - domLow);
 
@@ -115,7 +150,7 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
 
         bAtT = interp1(bt, bv', tb, 'linear', 'extrap')'; 
 
-        [gradTh, gradPh, lossVal, lPDE, lTerm, lHam] = dlfeval(@modelLoss, valueNet, policyNet, X, XT, ...
+        [gradTh, gradPh, lossVal, lPDE, lTerm, lHam, lCS] = dlfeval(@modelLoss, valueNet, policyNet, X, XT, ...
             re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
             currentTermWeight, aHigh, aLow, polCfg, termCfg);
 
@@ -163,22 +198,24 @@ function [valueNet, policyNet, info] = hjb_liver_pinn(bTraj, opts, refTraj)
         lossPDEHistory(iter) = double(lPDE);
         lossTermHistory(iter) = double(lTerm);
         lossHamHistory(iter) = double(lHam);
+        lossCSHistory(iter)  = double(lCS);
 
         if mod(iter, opts.printEvery) == 0 || iter == 1
-            fprintf('[HJB] iter %6d / %6d   V-loss = %.6g (PDE=%.6g, 終端=%.6g)   H(policy) = %.6g   termW=%.2g   lrP=%.2g   clip累計=%d\n', ...
+            fprintf('[HJB] iter %6d / %6d   V-loss = %.6g (PDE=%.6g, 終端=%.6g, 共状態=%.6g)   H(policy) = %.6g   lrP=%.2g   clip累計=%d\n', ...
                 iter, opts.numIters, lossHistory(iter), lossPDEHistory(iter), lossTermHistory(iter), ...
-                lossHamHistory(iter), currentTermWeight, lrP, nClipped);
+                lossCSHistory(iter), lossHamHistory(iter), lrP, nClipped);
         end
     end
 
     info = struct('lossHistory', lossHistory, 'lossPDEHistory', lossPDEHistory, ...
-        'lossTermHistory', lossTermHistory, 'lossHamHistory', lossHamHistory, 'opts', opts, 'bTraj', bTraj);
+        'lossTermHistory', lossTermHistory, 'lossHamHistory', lossHamHistory, ...
+        'lossCSHistory', lossCSHistory, 'opts', opts, 'bTraj', bTraj);
     save('hjb_solution.mat', 'valueNet', 'policyNet', 'info', 'bTraj', 'scaleX', 'T');
     fprintf('[HJB] 学習完了。hjb_solution.mat に保存しました。\n');
 end
 
 % =====================================================================
-function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(valueNet, policyNet, X, XT, ...
+function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam, lossCS] = modelLoss(valueNet, policyNet, X, XT, ...
     re, sigma, h, scaleX, T, bAtT, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, currentTermWeight, aHigh, aLow, polCfg, termCfg)
 
     xRaw = X(1:6,:);
@@ -193,6 +230,13 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     gradT = gradAll(7,:);
     gradXFixed = dlarray(extractdata(gradX));     
 
+    % 共状態の拘束: 最後の csN 列（軌道上の点）で ∇V が共状態 p に一致すること
+    lossCS = dlarray(0);
+    if polCfg.csN > 0
+        gC = gradX(:, end-polCfg.csN+1:end);
+        lossCS = mean(sum(((gC - polCfg.csP) .* polCfg.csW).^2, 1), 'all');
+    end
+
     if ~polCfg.usePolicyNet
         % --- controlMode='argminH': 制御を ∇V から直接 a* = argmin_a H(x,a,∇V) で求める ---
         % a* は ∇V の関数だが、包絡線定理により min_a H の ∇V に関する微分は f(x,a*) に
@@ -204,6 +248,7 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
             aFixed, re, sigma, h, bAtT, x05, x08, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
             aHigh, polCfg, termCfg, currentTermWeight);
         lossHam = mean(runCostV + sum(gradXFixed .* dxdt_v, 1), 'all'); % min_a H（記録用）
+        lossVal = lossVal + polCfg.csLambda .* lossCS;
         gradTh = dlgradient(lossVal, valueNet.Learnables);
         gradPh = [];
         return;
@@ -233,6 +278,7 @@ function [gradTh, gradPh, lossVal, lossPDE, lossTerm, lossHam] = modelLoss(value
     [lossVal, lossPDE, lossTerm] = value_loss(valueNet, X, XT, V0, gradX, gradT, ...
         aFixed, re, sigma, h, bAtT, x05, x08, targetCoA, targetX05, w_coa, w_x05, w_coaPush, w_ctrl, ...
         aHigh, polCfg, termCfg, currentTermWeight);
+    lossVal = lossVal + polCfg.csLambda .* lossCS;
 
     gradTh = dlgradient(lossVal, valueNet.Learnables);  
     gradPh = dlgradient(lossHam, policyNet.Learnables); 
@@ -347,7 +393,7 @@ function opts = parse_opts(opts)
         'targetCoA',     1000, ...
         'w_coa',         3.0 * (5/1.5), ... 
         'w_x05',         9.0 * (5/1.5), ...
-        'w_coaPush',     8.0, ... 
+        'w_coaPush',     0, ...   % ★8.0→0。coa過剰時に「排出するほど得」という制御に1次の大きな報酬が出て V を歪ませていた（DDPGの報酬にも無い）
         'w_ctrl',        1e-4, ...
         'w_logitPenalty', 1.0, ... % ★tanh手前のロジットが |z|>logitMax になった分だけ罰する
         'logitMax',      2.5, ...  % ★tanh(2.5)=0.987。範囲の端から約0.7%以内には入れない
@@ -371,6 +417,9 @@ function opts = parse_opts(opts)
         'lrDecayFactor', 0.5, ...   
         'lrWarmupIters', 2000, ...   % ★学習率を 0 から線形に立ち上げる反復数
         'gradClipFactor', 5, ...
+        'w_costate',     1, ...      % ★共状態の拘束（軌道上で ∇V = p）の重み。0で無効
+        'costateBatch',  128, ...    % ★1バッチに加える共状態の点の数
+        'costateEvery',  60, ...     % ★共状態をサンプルする間隔[秒]（costate_targets.m）
         'residualNorm',  true, ...   % ★HJB残差を各項の大きさで割った相対残差で学習する
         'residualEps',   1, ...      % ★相対残差の分母に足す定数（走行コストの単位[1/秒]）
         'tauFast',       1, ...      % ★速い反応 r13 を「tauFast秒で使い切る速さ」で頭打ち（liver_cell_drift_limited.m）     % ★価値ネットの勾配ノルムが移動平均の何倍を超えたら縮めるか

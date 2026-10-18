@@ -35,7 +35,8 @@ hjbOpts = struct('T', T, 'numIters', 40000, 'batchSize', 256, ...
 
 fpOpts = struct('T', T, 'numCells', 100, 'dt', 1, 'doPlot', false, ... % dt=10は不安定と判明(diagnose_stability.m)
                 'seed', 1, ...       % 全反復で同じ乱数列（共通乱数）を使い、MCノイズによる振動を防ぐ
-                'controlEvery', 10); % argminH の制御は10秒ごとに再計算（∇Vの評価が重いため）
+                'controlEvery', 10, ... % argminH の制御は10秒ごとに再計算（∇Vの評価が重いため）
+                'recordCells', 16);     % 共状態（随伴方程式）を計算する細胞数
 R = load('re_params.mat', 're'); re = R.re;
 hjbSeed = 1;
 
@@ -81,6 +82,13 @@ for k = 1:maxOuterIter
     % --- 次回のHJB学習で使う「実際に訪れた点」として今回のtrajを保存 ---
     refTraj = struct('t', traj.t, 'xAll', traj.xAll);
 
+    % --- 次回のHJB学習で使う共状態: 今回の制御に沿って随伴方程式を後ろ向きに解く ---
+    cs = [];
+    if hjbInfo.opts.w_costate > 0 && isfield(traj, 'ctrlRec')
+        cs = costate_targets(traj, re, hjbInfo.opts);
+        refTraj.costate = cs;
+    end
+
     % --- 3) 時刻グリッドを揃えてダンピング、収束判定 ---
     bOldOnNewGrid = interp1(bTraj.t, bTraj.val', bTrajNew.t, 'linear', 'extrap')';
     bUpdatedVal = (1-damping) .* bOldOnNewGrid + damping .* bTrajNew.val;
@@ -95,7 +103,7 @@ for k = 1:maxOuterIter
     bTraj = struct('t', bTrajNew.t, 'val', bUpdatedVal);
     bHistoryFinal(:,k+1) = bUpdatedVal(:,end);
 
-    save(sprintf('mfg_iter_%02d.mat', k), 'bTraj', 'valueNet', 'policyNet', 'traj', 'hjbInfo', 'fpInfo', '-v7.3');
+    save(sprintf('mfg_iter_%02d.mat', k), 'bTraj', 'valueNet', 'policyNet', 'traj', 'hjbInfo', 'fpInfo', 'cs', '-v7.3');
 
     if relChange < tolRel
         fprintf('\n収束しました（不動点残差 %.4g < 許容値 %.4g）。反復 %d で終了。\n', ...

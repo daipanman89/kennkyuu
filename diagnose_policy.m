@@ -29,6 +29,8 @@ end
 fname = files(idx).name;
 fprintf('読み込み中: %s\n', fname);
 S = load(fname, 'valueNet', 'policyNet', 'traj', 'hjbInfo');
+W = whos('-file', fname);
+if any(strcmp({W.name}, 'cs')), C = load(fname, 'cs'); S.cs = C.cs; else, S.cs = []; end
 
 R = load('re_params.mat', 're');
 re = R.re;
@@ -73,13 +75,13 @@ for k = 1:K
     for sweep = 1:nSweep
         for i = 1:6
             % a1 は Ka=10 付近で感度が高いので 0 近くを細かく取る
-            grid = unique([linspace(aLow(i), aHigh(i), nGrid), ...
+            aGrid = unique([linspace(aLow(i), aHigh(i), nGrid), ...
                            aLow(i) + logspace(-3, log10(aHigh(i)-aLow(i)), 200)]);
-            A = repmat(a, 1, numel(grid));
-            A(i,:) = grid;
-            Hg = hamiltonian(repmat(x,1,numel(grid)), A, b, pk, re, opts);
+            A = repmat(a, 1, numel(aGrid));
+            A(i,:) = aGrid;
+            Hg = hamiltonian(repmat(x,1,numel(aGrid)), A, b, pk, re, opts);
             [~, j] = min(Hg);
-            a(i) = grid(j);
+            a(i) = aGrid(j);
         end
     end
     aOpt(:,k) = a;
@@ -143,6 +145,27 @@ grid on; xlabel('time [hour]'); ylabel('magnitude [1/sec]');
 legend({'分母の合計(epsなし)','|\partial_tV|','|L|','\Sigma|\partialV/\partialx_i f_i|', ...
         '|\partialV/\partialx08 \cdot f08| (coa方向)', sprintf('residualEps = %g', eps0)}, 'Location','best');
 title('相対残差の分母の内訳（赤線より下の項は eps に埋もれて感度が鈍る）');
+
+%% ---- 図4: 学習した ∇V と、随伴方程式で求めた共状態 p の比較（細胞1） ----
+% cs はこの反復の FP の制御に沿って後ろ向きに解いた ∂V/∂x。∇V がこれに沿っていれば、
+% 価値関数がこの軌道上のコストの感度を正しく表している。
+if ~isempty(S.cs)
+    xc = squeeze(S.cs.x(:,1,:)); pc = squeeze(S.cs.p(:,1,:)); tc = S.cs.t(:)';
+    [~, gC] = dlfeval(@value_and_grad, S.valueNet, dlarray([xc; tc], 'CB'), opts);
+    gC = double(extractdata(gC(1:6,:)));
+    figure('Name', sprintf('[%s] ∇V と共状態 p の比較', fname));
+    lbl = {'x05','x08 (coa)'}; idxs = [1 4];
+    for j = 1:2
+        subplot(2,1,j);
+        plot(tc/3600, pc(idxs(j),:), 'k-', 'LineWidth',1.5); hold on;
+        plot(tc/3600, gC(idxs(j),:), 'b--', 'LineWidth',1.3); yline(0,'k:');
+        grid on; xlabel('time [hour]'); ylabel(['\partialV/\partial' lbl{j}]);
+        legend({'共状態 p（随伴方程式）','学習した \nablaV'}, 'Location','best');
+        title(sprintf('%s: 共状態と学習した勾配', lbl{j}));
+    end
+    sgn = mean(sign(gC([1 4],:)) == sign(pc([1 4],:)), 2);
+    fprintf('共状態と符号が一致する割合: x05 %.0f %%, x08 %.0f %%\n', 100*sgn(1), 100*sgn(2));
+end
 
 %% ---- 数値のまとめ ----
 low = xK(4,:) < opts.targetCoA;

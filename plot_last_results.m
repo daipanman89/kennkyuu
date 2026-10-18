@@ -49,6 +49,10 @@ if isfield(S.hjbInfo, 'lossPDEHistory')
         semilogy(abs(S.hjbInfo.lossHamHistory));
         legendEntries{end+1} = '|H(policy)| (方策のハミルトニアン)';
     end
+    if isfield(S.hjbInfo, 'lossCSHistory') && any(S.hjbInfo.lossCSHistory > 0)
+        semilogy(S.hjbInfo.lossCSHistory);
+        legendEntries{end+1} = '共状態の拘束 (\nablaV と p のずれ)';
+    end
     grid on;
     xlabel('HJB iteration'); ylabel('loss (log scale)');
     legend(legendEntries, 'Location','best');

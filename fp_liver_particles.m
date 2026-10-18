@@ -84,6 +84,17 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
     aLow  = opts.aLow;
     aHigh = opts.aHigh;
 
+    % --- 共状態（随伴方程式）計算用: 先頭 recordCells 個の細胞の初期状態と、
+    %     制御更新ごとの制御・血中状態を記録する（costate_targets.m で使う） ---
+    nRec = min(opts.recordCells, N);
+    nCtrl = ceil(nSteps / opts.controlEvery);
+    if nRec > 0
+        recX0 = x(:, 1:nRec);
+        recA  = zeros(6, nRec, nCtrl);
+        recB  = zeros(4, nCtrl);
+    end
+    ic = 0;
+
     for step = 1:nSteps
         tCur = (step-1) * dt;
 
@@ -99,6 +110,11 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
                 a = extractdata(aRaw);
             end
             a = min(max(a, aLow), aHigh);
+            ic = ic + 1;
+            if nRec > 0
+                recA(:,:,ic) = a(:, 1:nRec);
+                recB(:,ic)   = b;
+            end
         end
 
         % --- 各細胞の細胞内ドリフト + 血中側フラックス ---
@@ -147,6 +163,10 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
 
     traj = struct('t', tLog, 'b', bLog, 'xMean', xMeanLog, 'xStd', xStdLog, ...
                    'xAll', xAllLog, 'aMean', aMeanLog, 'xFinal', x, 'aFinal', a);
+    if nRec > 0
+        traj.ctrlRec = struct('x0', recX0, 'a', recA(:,:,1:ic), 'b', recB(:,1:ic), ...
+            'dt', dt, 'dtCtrl', opts.controlEvery * dt, 'T', T);
+    end
     info = struct('opts', opts, 'bInit', bInit);
 
     save('fp_solution.mat', 'traj', 'info', 'bTrajNew');
@@ -197,7 +217,8 @@ function opts = parse_opts(opts)
         'doPlot',         true, ...
         'seed',           [], ...    % 乱数シード（[]なら設定しない）
         'controlEvery',   1, ...     % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
-        'tauFast',        1 ...      % 速い反応 r13 の頭打ちの時定数[秒]（hjb_liver_pinn.m と合わせる）
+        'tauFast',        1, ...     % 速い反応 r13 の頭打ちの時定数[秒]（hjb_liver_pinn.m と合わせる）
+        'recordCells',    0 ...      % 共状態計算用に制御を記録する細胞数（0なら記録しない）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)
