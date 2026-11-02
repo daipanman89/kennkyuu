@@ -25,9 +25,17 @@ clearvars; clc;
 T = 24*3600; % 24時間（DDPGのt1=360sec×240step相当）
 
 %% ---- Picard反復の設定 ----
-maxOuterIter = 20;
-damping      = 0.2;
+maxOuterIter = 40;
+damping      = 0.2;          % dampingMode='constant' のときの混合率
+% 'fictitious': 混合率を α_k = 1/(k+1) と反復ごとに小さくする（fictitious play）。
+%   これまでの結果の平均 b_{k+1} = (k b_k + Φ(b_k))/(k+1) を取ることに相当し、
+%   最適応答が b に対して不連続に切り替わる（bang-bang な制御）場合でも、
+%   一定の混合率のような振動（残差が 0.1〜0.3 で横ばい）を起こしにくい。
+dampingMode  = 'fictitious'; % 'fictitious' または 'constant'
 tolRel       = 1e-3;
+% 途中から再開する場合は、その反復番号を入れる（例: 20 なら mfg_iter_20.mat から再開）。
+% 0 なら最初から。再開時も不動点残差・b(T)の推移は plot_picard_convergence.m で見られる。
+resumeFrom   = 0;
 
 % PINN版のオプション
 hjbOpts = struct('T', T, 'numIters', 40000, 'batchSize', 256, ...
@@ -53,7 +61,17 @@ bHistoryFinal = zeros(4, maxOuterIter+1); % 各反復での b(T)（終端値）�
 bHistoryFinal(:,1) = b0;
 valueNet = []; policyNet = []; % 2回目以降は前回のネットからウォームスタートする
 
-for k = 1:maxOuterIter
+if resumeFrom > 0
+    Rz = load(sprintf('mfg_iter_%02d.mat', resumeFrom), 'bTraj', 'valueNet', 'policyNet', 'traj', 'cs');
+    bTraj = Rz.bTraj; valueNet = Rz.valueNet; policyNet = Rz.policyNet;
+    refTraj = struct('t', Rz.traj.t, 'xAll', Rz.traj.xAll);
+    if isfield(Rz, 'cs') && ~isempty(Rz.cs), refTraj.costate = Rz.cs; end
+    bHistoryFinal(:, 1:resumeFrom) = NaN;
+    bHistoryFinal(:, resumeFrom+1) = bTraj.val(:,end);
+    fprintf('mfg_iter_%02d.mat から再開します。\n', resumeFrom);
+end
+
+for k = resumeFrom+1:maxOuterIter
     fprintf('\n========== Picard反復 %d / %d ==========\n', k, maxOuterIter);
     fprintf('現在の b(0) = [%s]\n', mat2str(bTraj.val(:,1)',4));
 
@@ -91,14 +109,19 @@ for k = 1:maxOuterIter
 
     % --- 3) 時刻グリッドを揃えてダンピング、収束判定 ---
     bOldOnNewGrid = interp1(bTraj.t, bTraj.val', bTrajNew.t, 'linear', 'extrap')';
-    bUpdatedVal = (1-damping) .* bOldOnNewGrid + damping .* bTrajNew.val;
+    if strcmp(dampingMode, 'fictitious')
+        alpha = 1 / (k + 1);
+    else
+        alpha = damping;
+    end
+    bUpdatedVal = (1-alpha) .* bOldOnNewGrid + alpha .* bTrajNew.val;
 
     % 不動点残差 ||Φ(b_k) - b_k|| / ||b_k||（ダンピング前で評価する。ダンピング後の差で
     % 評価すると damping 倍だけ小さく見え、許容値が実質 1/damping 倍緩くなってしまう）
     relChange = norm(bTrajNew.val - bOldOnNewGrid, 'fro') / max(norm(bOldOnNewGrid,'fro'), 1e-8);
 
     fprintf('b_new(T)(FPより) = [%s]\n', mat2str(bTrajNew.val(:,end)',4));
-    fprintf('b_updated(T)     = [%s]   (不動点残差 %.4g)\n', mat2str(bUpdatedVal(:,end)',4), relChange);
+    fprintf('b_updated(T)     = [%s]   (不動点残差 %.4g, 混合率 %.3g)\n', mat2str(bUpdatedVal(:,end)',4), relChange, alpha);
 
     bTraj = struct('t', bTrajNew.t, 'val', bUpdatedVal);
     bHistoryFinal(:,k+1) = bUpdatedVal(:,end);
