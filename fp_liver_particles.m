@@ -65,6 +65,11 @@ function [bTrajNew, traj, info] = fp_liver_particles(policyNet, bInit, opts)
     x0center = scaleX; % 細胞内状態は目標値そのままスタート(+1000は血中因子側のみ)
     x = x0center .* (1 + opts.initSpreadFrac .* randn(6, N));
     x = max(x, 0);
+    if ~isempty(opts.x0)
+        % 初期状態を外から与える（FBSM 版で、最適応答を計算した細胞と同じ細胞を使うため）。
+        % 上の randn は呼んだままにして、ノイズの乱数列を PINN 版と同じに保つ
+        x = opts.x0;
+    end
     b = bInit;
 
     % --- ログ用バッファ ---
@@ -218,7 +223,8 @@ function opts = parse_opts(opts)
         'seed',           [], ...    % 乱数シード（[]なら設定しない）
         'controlEvery',   1, ...     % 制御を何ステップごとに再計算するか（間はゼロ次ホールド）
         'tauFast',        1, ...     % 速い反応 r13 の頭打ちの時定数[秒]（hjb_liver_pinn.m と合わせる）
-        'recordCells',    0 ...      % 共状態計算用に制御を記録する細胞数（0なら記録しない）
+        'recordCells',    0, ...     % 共状態計算用に制御を記録する細胞数（0なら記録しない）
+        'x0',             [] ...     % 6×N の初期状態を直接与える場合（[]なら乱数で生成）
     );
     fn = fieldnames(defaults);
     for k = 1:numel(fn)

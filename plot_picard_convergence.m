@@ -9,13 +9,16 @@
 
 clearvars; clc;
 
-files = dir('mfg_iter_*.mat');
+% PINN 版は 'mfg_iter_'、FBSM 版（run_mfg_fbsm.m）の結果を見るときは 'fbsm_iter_' にする
+prefix = 'mfg_iter_';
+
+files = dir([prefix '*.mat']);
 if isempty(files)
     error('mfg_iter_XX.mat が見つかりません。run_mfg_picard.m を一度は実行してください。');
 end
 nums = zeros(numel(files),1);
 for i = 1:numel(files)
-    tok = regexp(files(i).name, 'mfg_iter_(\d+)\.mat', 'tokens');
+    tok = regexp(files(i).name, [prefix '(\d+)\.mat'], 'tokens');
     nums(i) = str2double(tok{1}{1});
 end
 nums = sort(nums);
@@ -26,7 +29,7 @@ relRes = zeros(1, nK);     % 不動点残差
 bOld = [];
 phiB = []; phiX = [];      % 各反復の FP 出力 Φ(b_k)（血中 b(t)）と母集団平均 x(t)
 for k = 1:nK
-    S = load(sprintf('mfg_iter_%02d.mat', nums(k)), 'bTraj', 'traj');
+    S = load(sprintf('%s%02d.mat', prefix, nums(k)), 'bTraj', 'traj');
     if isempty(phiB)
         tPhi = S.traj.t(:)';
         phiB = zeros(4, numel(tPhi), nK);
